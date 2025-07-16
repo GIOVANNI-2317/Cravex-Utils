@@ -1,0 +1,2368 @@
+#include "environment.hpp"
+
+#include "../roblox/scheduler/scheduler.hpp"
+
+#include "../../dependencies/cpr/include/cpr/HttpStatus.hpp"
+#include "../../dependencies/cpr/include/cpr/auth.h"
+#include "../../dependencies/cpr/include/cpr/api.h"
+#include "../../dependencies/cpr/include/cpr/cpr.h"
+
+/*
+#define CRYPTOPP_ENABLE_NAMESPACE_WEAK 1
+#include "../../dependencies/cryptopp/include/cryptopp/base64.h"
+#include "../../dependencies/cryptopp/include/cryptopp/sha.h"
+#include "../../dependencies/cryptopp/include/cryptopp/sha3.h"
+#include "../../dependencies/cryptopp/include/cryptopp/rdrand.h"
+#include "../../dependencies/cryptopp/include/cryptopp/aes.h"
+#include "../../dependencies/cryptopp/include/cryptopp/modes.h"
+#include "../../dependencies/cryptopp/include/cryptopp/hex.h"
+#include "../../dependencies/cryptopp/include/cryptopp/md5.h"
+*/
+
+#include <cryptopp/include/cryptopp/base64.h>
+#include <cryptopp/include/cryptopp/sha.h>
+#include <cryptopp/include/cryptopp/sha3.h>
+#include <cryptopp/include/cryptopp/rdrand.h>
+#include <cryptopp/include/cryptopp/aes.h>
+#include <cryptopp/include/cryptopp/modes.h>
+#include <cryptopp/include/cryptopp/hex.h>
+#include <cryptopp/include/cryptopp/md5.h>
+#include <cryptopp/include/cryptopp/cryptlib.h>
+
+#include "../environment/Utilies/Miscellaneous.h"
+#include "../environment/Utilies/Debug.h"
+#include "../environment/Utilies/Cache.h"
+#include "../environment/Utilies/Console.h"
+
+#include <lualib.h>
+#include <windows.h>
+#include <wininet.h>
+#include <regex>
+#include <filesystem>
+#include <iosfwd>
+#include <fstream>
+
+__forceinline bool CheckMemory(uintptr_t address) {
+	if (address < 0x10000 || address > 0x7FFFFFFFFFFF) {
+		return false;
+	}
+
+	MEMORY_BASIC_INFORMATION mbi;
+	if (VirtualQuery(reinterpret_cast<void*>(address), &mbi, sizeof(mbi)) == 0) {
+		return false;
+	}
+
+	if (mbi.Protect & PAGE_NOACCESS || mbi.State != MEM_COMMIT) {
+		return false;
+	}
+
+	return true;
+}
+
+namespace CravexEnv
+{
+	namespace yielder
+	{
+		using yield_return = std::function<int(lua_State* L)>;
+
+		struct task_data
+		{
+			lua_State* state;
+			std::function<yield_return()> generator;
+			PTP_WORK work;
+		};
+
+		inline VOID CALLBACK thread_worker(PTP_CALLBACK_INSTANCE instance, PVOID context, PTP_WORK work)
+		{
+			auto* data = static_cast<task_data*>(context);
+
+			try
+			{
+				auto yield_result = data->generator();
+				int result_count = yield_result(data->state);
+
+				lua_State* thread_ctx = lua_newthread(data->state);
+
+				lua_getglobal(thread_ctx, "task");
+				lua_getfield(thread_ctx, -1, "defer");
+				lua_pushthread(data->state);
+				lua_xmove(data->state, thread_ctx, 1);
+				lua_pop(data->state, 1);
+
+				for (int i = result_count; i >= 1; --i)
+				{
+					lua_pushvalue(data->state, -i);
+					lua_xmove(data->state, thread_ctx, 1);
+				}
+
+				lua_pcall(thread_ctx, result_count + 1, 0, 0);
+				lua_settop(thread_ctx, 0);
+			}
+			catch (const std::exception&)
+			{
+				// handle exceptions if needed
+			}
+
+			CloseThreadpoolWork(data->work);
+			delete data;
+		}
+
+		inline int yield_execution(lua_State* L, const std::function<yield_return()>& generator)
+		{
+			lua_pushthread(L);
+			lua_ref(L, -1);
+			lua_pop(L, 1);
+
+			auto* task = new task_data{ L, generator, nullptr };
+
+			task->work = CreateThreadpoolWork(thread_worker, task, nullptr);
+			if (task->work)
+			{
+				SubmitThreadpoolWork(task->work);
+			}
+			else
+			{
+				delete task;
+			}
+
+			L->base = L->top;
+			L->status = LUA_YIELD;
+			L->ci->flags |= 1;
+			return -1;
+		}
+	}
+
+	namespace env
+	{
+		namespace cryptLibrary {
+
+			namespace HelpFunctions {
+
+				template<typename T>
+				static std::string hash_with_algo(const std::string& Input)
+				{
+					T Hash;
+					std::string Digest;
+
+					CryptoPP::StringSource SS(Input, true,
+						new CryptoPP::HashFilter(Hash,
+							new CryptoPP::HexEncoder(
+								new CryptoPP::StringSink(Digest), false
+							)));
+
+					return Digest;
+				}
+				std::string b64encode(const std::string& stringToEncode) {
+					std::string base64EncodedString;
+					CryptoPP::Base64Encoder encoder{ new CryptoPP::StringSink(base64EncodedString), false };
+					encoder.Put((byte*)stringToEncode.c_str(), stringToEncode.length());
+					encoder.MessageEnd();
+
+					return base64EncodedString;
+				}
+
+				std::string b64decode(const std::string& stringToDecode) {
+					std::string base64DecodedString;
+					CryptoPP::Base64Decoder decoder{ new CryptoPP::StringSink(base64DecodedString) };
+					decoder.Put((byte*)stringToDecode.c_str(), stringToDecode.length());
+					decoder.MessageEnd();
+
+					return base64DecodedString;
+				}
+
+				std::string RamdonString(int len) {
+					static const char* chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890";
+					std::string str;
+					str.reserve(len);
+
+					for (int i = 0; i < len; ++i) {
+						str += chars[rand() % (strlen(chars) - 1)];
+					}
+
+					return str;
+				}
+			}
+
+			enum HashModes
+			{
+				//MD5
+				MD5,
+
+				//SHA1
+				SHA1,
+
+				//SHA2
+				SHA224,
+				SHA256,
+				SHA384,
+				SHA512,
+
+				//SHA3
+				SHA3_224,
+				SHA3_256,
+				SHA3_384,
+				SHA3_512,
+			};
+
+			std::map<std::string, HashModes> HashTranslationMap = {
+				//MD5
+				{ "md5", MD5 },
+
+				//SHA1
+				{ "sha1", SHA1 },
+
+				//SHA2
+				{ "sha224", SHA224 },
+				{ "sha256", SHA256 },
+				{ "sha384", SHA384 },
+				{ "sha512", SHA512 },
+
+				//SHA3
+				{ "sha3-224", SHA3_224 },
+				{ "sha3_224", SHA3_224 },
+				{ "sha3-256", SHA3_256 },
+				{ "sha3_256", SHA3_256 },
+				{ "sha3-384", SHA3_384 },
+				{ "sha3_384", SHA3_384 },
+				{ "sha3-512", SHA3_512 },
+				{ "sha3_512", SHA3_512 },
+			};
+
+			int base64encode(lua_State* L) {
+				//("crypt.base64encode");
+
+				luaL_checktype(L, 1, LUA_TSTRING);
+				size_t stringLength;
+				const char* rawStringToEncode = lua_tolstring(L, 1, &stringLength);
+				const std::string stringToEncode(rawStringToEncode, stringLength);
+				const std::string encodedString = HelpFunctions::b64encode(stringToEncode);
+
+				lua_pushlstring(L, encodedString.c_str(), encodedString.size());
+				return 1;
+			}
+
+			int base64decode(lua_State* L) {
+				//("crypt.base64decode");
+
+				luaL_checktype(L, 1, LUA_TSTRING);
+				size_t stringLength;
+				const char* rawStringToDecode = lua_tolstring(L, 1, &stringLength);
+				const auto stringToDecode = std::string(rawStringToDecode, stringLength);
+				const std::string decodedString = HelpFunctions::b64decode(stringToDecode);
+
+				lua_pushlstring(L, decodedString.c_str(), decodedString.size());
+				return 1;
+			}
+
+			int generatebytes(lua_State* L) {
+				//("crypt.generatebytes");
+
+				luaL_checktype(L, 1, LUA_TNUMBER);
+				const auto bytesSize = lua_tointeger(L, 1);
+
+				CryptoPP::RDRAND rng;
+				const auto bytesBuffer = new byte[bytesSize];
+				rng.GenerateBlock(bytesBuffer, bytesSize);
+
+				std::string base64EncodedBytes;
+				CryptoPP::Base64Encoder encoder{ new CryptoPP::StringSink(base64EncodedBytes), false };
+				encoder.Put(bytesBuffer, bytesSize);
+				encoder.MessageEnd();
+
+				delete bytesBuffer;
+				lua_pushlstring(L, base64EncodedBytes.c_str(), base64EncodedBytes.size());
+				return 1;
+			}
+
+			int generatekey(lua_State* L) {
+				//("crypt.generatekey");
+
+				const auto bytesBuffer = new byte[CryptoPP::AES::MAX_KEYLENGTH];
+
+				CryptoPP::RDRAND rng;
+				rng.GenerateBlock(bytesBuffer, CryptoPP::AES::MAX_KEYLENGTH);
+
+				std::string base64EncodedBytes;
+				CryptoPP::Base64Encoder encoder{ new CryptoPP::StringSink(base64EncodedBytes), false };
+				encoder.Put(bytesBuffer, CryptoPP::AES::MAX_KEYLENGTH);
+				encoder.MessageEnd();
+
+				delete bytesBuffer;
+				lua_pushlstring(L, base64EncodedBytes.c_str(), base64EncodedBytes.size());
+				return 1;
+			}
+
+			int hash(lua_State* L) {
+				//("crypt.hash");
+
+				std::string algo = luaL_checklstring(L, 2, NULL);
+				std::string data = luaL_checklstring(L, 1, NULL);
+
+				std::transform(algo.begin(), algo.end(), algo.begin(), tolower);
+
+				if (!HashTranslationMap.count(algo))
+				{
+					luaL_argerror(L, 1, "non-existant hash algorithm");
+					return 0;
+				}
+
+				const auto ralgo = HashTranslationMap[algo];
+
+				std::string hash;
+
+				if (ralgo == MD5) {
+					hash = HelpFunctions::hash_with_algo<CryptoPP::MD5>(data);
+				}
+				else if (ralgo == SHA1) {
+					hash = HelpFunctions::hash_with_algo<CryptoPP::SHA1>(data);
+				}
+				else if (ralgo == SHA224) {
+					hash = HelpFunctions::hash_with_algo<CryptoPP::SHA224>(data);
+				}
+				else if (ralgo == SHA256) {
+					hash = HelpFunctions::hash_with_algo<CryptoPP::SHA256>(data);
+				}
+				else if (ralgo == SHA384) {
+					hash = HelpFunctions::hash_with_algo<CryptoPP::SHA384>(data);
+				}
+				else if (ralgo == SHA512) {
+					hash = HelpFunctions::hash_with_algo<CryptoPP::SHA512>(data);
+				}
+				else if (ralgo == SHA3_224) {
+					hash = HelpFunctions::hash_with_algo<CryptoPP::SHA3_224>(data);
+				}
+				else if (ralgo == SHA3_256) {
+					hash = HelpFunctions::hash_with_algo<CryptoPP::SHA3_256>(data);
+				}
+				else if (ralgo == SHA3_384) {
+					hash = HelpFunctions::hash_with_algo<CryptoPP::SHA3_384>(data);
+				}
+				else if (ralgo == SHA3_512) {
+					hash = HelpFunctions::hash_with_algo<CryptoPP::SHA3_512>(data);
+				}
+				else {
+					luaL_argerror(L, 1, "non-existant hash algorithm");
+					return 0;
+				}
+
+				lua_pushlstring(L, hash.c_str(), hash.size());
+
+				return 1;
+			}
+			using ModePair = std::pair<std::unique_ptr<CryptoPP::CipherModeBase>, std::unique_ptr<CryptoPP::CipherModeBase> >;
+
+			std::optional<ModePair> getEncryptionDecryptionMode(const std::string& modeName) {
+				if (modeName == "cbc") {
+					//("Mode:cbc");
+					return ModePair{
+						std::make_unique<CryptoPP::CBC_Mode<CryptoPP::AES>::Encryption>(),
+						std::make_unique<CryptoPP::CBC_Mode<CryptoPP::AES>::Decryption>()
+					};
+				}
+				else if (modeName == "cfb") {
+					return ModePair{
+						std::make_unique<CryptoPP::CFB_Mode<CryptoPP::AES>::Encryption>(),
+						std::make_unique<CryptoPP::CFB_Mode<CryptoPP::AES>::Decryption>()
+					};
+				}
+				else if (modeName == "ofb") {
+					return ModePair{
+						std::make_unique<CryptoPP::OFB_Mode<CryptoPP::AES>::Encryption>(),
+						std::make_unique<CryptoPP::OFB_Mode<CryptoPP::AES>::Decryption>()
+					};
+				}
+				else if (modeName == "ctr") {
+					return ModePair{
+						std::make_unique<CryptoPP::CTR_Mode<CryptoPP::AES>::Encryption>(),
+						std::make_unique<CryptoPP::CTR_Mode<CryptoPP::AES>::Decryption>()
+					};
+				}
+				else if (modeName == "ecb") {
+					return ModePair{
+						std::make_unique<CryptoPP::ECB_Mode<CryptoPP::AES>::Encryption>(),
+						std::make_unique<CryptoPP::ECB_Mode<CryptoPP::AES>::Decryption>()
+					};
+				}
+				else {
+					return std::nullopt;
+				}
+			}
+
+			int encrypt(lua_State* L) {
+				//("crypt.encrypt");
+
+				luaL_checktype(L, 1, LUA_TSTRING);
+				luaL_checktype(L, 2, LUA_TSTRING);
+
+				const auto rawDataString = lua_tostring(L, 1);
+				lua_pushstring(L, HelpFunctions::b64encode(rawDataString).c_str());
+				lua_pushstring(L, "");
+
+				return 2;
+			}
+
+			int decrypt(lua_State* L) {
+				//("crypt.decrypt");
+
+				luaL_checktype(L, 1, LUA_TSTRING);
+				luaL_checktype(L, 2, LUA_TSTRING);
+				luaL_checktype(L, 3, LUA_TSTRING);
+				luaL_checktype(L, 4, LUA_TSTRING);
+
+				const auto rawDataString = lua_tostring(L, 1);
+				lua_pushstring(L, HelpFunctions::b64decode(rawDataString).c_str());
+				return 1;
+			}
+		};
+
+		namespace http
+		{
+			int get_objects(lua_State* L)
+			{
+				lua_getglobal(L, "game");
+				lua_getfield(L, -1, "GetService");
+				lua_pushvalue(L, -2);
+				lua_pushstring(L, "InsertService");
+				lua_call(L, 2, 1);
+
+				lua_getfield(L, -1, "LoadLocalAsset");
+				lua_pushvalue(L, -2);
+				lua_pushstring(L, lua_tostring(L, 2));
+				lua_call(L, 2, 1);
+
+				lua_newtable(L);
+				lua_pushvalue(L, -2);
+				lua_rawseti(L, -2, 1);
+				return 1;
+			}
+
+			int httpget(lua_State* L)
+			{
+				std::string url;
+				if (!lua_isstring(L, 1)) {
+					luaL_checkstring(L, 2);
+					url = lua_tostring(L, 2);
+				}
+				else {
+					url = lua_tostring(L, 1);
+				}
+
+				if (url.find("http://") != 0 && url.find("https://") != 0) {
+					luaL_argerror(L, 1, "Invalid protocol (expected 'http://' or 'https://')");
+				}
+
+				std::optional<std::string> job_id;
+				lua_getglobal(L, "game");
+				lua_getfield(L, -1, "JobId");
+				if (lua_isstring(L, -1))
+					job_id = lua_tostring(L, -1);
+				lua_pop(L, 2);
+
+				uintptr_t place_id = 0;
+				lua_getglobal(L, "game");
+				lua_getfield(L, -1, "PlaceId");
+				if (lua_isnumber(L, -1))
+					place_id = static_cast<uintptr_t>(lua_tointeger(L, -1));
+				lua_pop(L, 2);
+
+				return CravexEnv::yielder::yield_execution(L, [url, job_id, place_id]() -> CravexEnv::yielder::yield_return {
+					return [url, job_id, place_id](lua_State* L) -> int {
+						std::string session_id_header;
+						if (job_id.has_value()) {
+							session_id_header = "{\"GameId\":\"" + job_id.value() + "\",\"PlaceId\":\"" + std::to_string(place_id) + "\"}";
+						}
+						else {
+							session_id_header = "{\"GameId\":\"empty value\",\"PlaceId\":\"empty value\"}";
+						}
+
+						HINTERNET h_internet = InternetOpenA("Roblox/WinInet", INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
+						if (!h_internet) {
+							lua_pushstring(L, "HttpGet failed: InternetOpenA failed");
+							return 1;
+						}
+
+						HINTERNET h_url = InternetOpenUrlA(h_internet, url.c_str(), nullptr, 0, INTERNET_FLAG_RELOAD, 0);
+						if (!h_url) {
+							InternetCloseHandle(h_internet);
+							lua_pushstring(L, "HttpGet failed: InternetOpenUrlA failed");
+							return 1;
+						}
+
+						std::string response;
+						char buffer[4096];
+						DWORD bytes_read = 0;
+
+						while (InternetReadFile(h_url, buffer, sizeof(buffer), &bytes_read) && bytes_read > 0)
+							response.append(buffer, bytes_read);
+
+						InternetCloseHandle(h_url);
+						InternetCloseHandle(h_internet);
+
+						if (response.empty()) {
+							lua_pushstring(L, "HttpGet failed: empty response");
+							return 1;
+						}
+
+						lua_pushlstring(L, response.data(), response.size());
+						return 1;
+						};
+					});
+			}
+		}
+
+		namespace test
+		{
+			int identify_executor(lua_State* L)
+			{
+				lua_pushstring(L, "Cravex");
+				lua_pushstring(L, "0.1.0");
+				return 2;
+			}
+
+			int getloadedmodules(lua_State* LS) {
+				lua_pop(LS, lua_gettop(LS));
+
+				//CravexEnv::env::test::getrunningscripts(LS);
+
+				if (!lua_istable(LS, -1)) {
+					lua_pop(LS, 1);
+					lua_pushnil(LS);
+					return 1;
+				}
+
+				lua_newtable(LS);
+				int resultIndex = lua_gettop(LS);
+
+				int index = 0;
+
+				lua_pushnil(LS);
+				while (lua_next(LS, -3) != 0) {
+					if (!lua_isnil(LS, -1)) {
+						lua_getfield(LS, -1, "ClassName");
+
+						if (lua_isstring(LS, -1)) {
+							std::string type = lua_tostring(LS, -1);
+							if (type == "ModuleScript") {
+								lua_pushinteger(LS, ++index);
+								lua_pushvalue(LS, -3);
+								lua_settable(LS, resultIndex);
+							}
+						}
+
+						lua_pop(LS, 1);
+					}
+
+					lua_pop(LS, 1);
+				}
+
+				lua_remove(LS, -2);
+
+				return 1;
+			};
+
+			int getscriptbytecode(lua_State* L) {
+				int type = lua_type(L, 1);
+				if (type != LUA_TUSERDATA && type != LUA_TLIGHTUSERDATA) {
+					lua_pushnil(L);
+					return 1;
+				}
+
+				uintptr_t script = *(uintptr_t*)lua_touserdata(L, 1);
+
+				if (!CheckMemory(script) || !CheckMemory(*(uintptr_t*)(script + update::offsets::datamodel::ClassDescriptor))) {
+					lua_pushnil(L);
+					return 1;
+				}
+
+				const char* className = *(const char**)(*(uintptr_t*)(script + update::offsets::datamodel::ClassDescriptor) + update::offsets::datamodel::ClassName);
+
+				bool decrypt = true;
+				std::string bytecode = "";
+
+				if (strcmp(className, "LocalScript") == 0) {
+					uintptr_t bytecodePointer = *(uintptr_t*)(script + update::offsets::script::LocalScriptEmbedded);
+					bytecode = *(std::string*)(bytecodePointer + 0x10);
+
+					if (bytecode.size() <= 8) {
+						bytecode = "";
+						decrypt = false;
+
+						lua_pushstring(L, "Invalid bytecode size");
+					}
+				}
+				else if (strcmp(className, "ModuleScript") == 0) {
+					uintptr_t bytecodePointer = *(uintptr_t*)(script + update::offsets::script::ModuleScriptEmbedded);
+					bytecode = *(std::string*)(bytecodePointer + 0x10);
+
+					if (bytecode.size() <= 8) {
+						bytecode = "";
+						decrypt = false;
+
+						lua_pushstring(L, "Invalid bytecode size");
+					}
+				}
+				else if (strcmp(className, "Script") == 0) {
+					bytecode = "";
+					decrypt = false;
+
+					lua_pushstring(L, "Scripts cannot be decompressed");
+				}
+				else {
+					bytecode = "";
+					decrypt = false;
+
+					lua_pushstring(L, "Invalid Script");
+				}
+
+				if (decrypt) {
+					const auto decompressedBytecode = DecompressBytecode(bytecode);
+					if (decompressedBytecode.empty()) {
+						lua_pushstring(L, "Invalid bytecode format");
+						return 1;
+					}
+
+					lua_pushlstring(L, decompressedBytecode.data(), decompressedBytecode.size());
+				}
+
+				return 1;
+			}
+
+			int get_genv(lua_State* L)
+			{
+				lua_pushvalue(L, LUA_ENVIRONINDEX);
+				return 1;
+			}
+
+			int load_string(lua_State* L)
+			{
+				luaL_checktype(L, 1, LUA_TSTRING);
+
+				const char* source = lua_tostring(L, 1);
+				const char* chunk_name = luaL_optstring(L, 2, "@Cravex");
+
+				std::string bytecode = compile_script(source);
+
+				if (luau_load(L, chunk_name, bytecode.c_str(), bytecode.size(), 0) != LUA_OK)
+				{
+					lua_pushnil(L);
+					lua_pushvalue(L, -2);
+					return 2;
+				}
+
+				if (Closure* func = lua_toclosure(L, -1))
+				{
+					if (func->l.p)
+						task_scheduler::set_proto_capabilities(func->l.p, &max_caps);
+				}
+
+				lua_setsafeenv(L, LUA_GLOBALSINDEX, false);
+				return 1;
+			}
+
+			int setclipboard(lua_State* LS) {
+				luaL_checktype(LS, 1, LUA_TSTRING);
+
+				std::string content = lua_tostring(LS, 1);
+
+				HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, content.size() + 1);
+				memcpy(GlobalLock(hMem), content.data(), content.size());
+				GlobalUnlock(hMem);
+				OpenClipboard(0);
+				EmptyClipboard();
+				SetClipboardData(CF_TEXT, hMem);
+				CloseClipboard();
+				return 0;
+			};
+
+			struct scan_context
+			{
+				lua_State* thread;
+				int result_index;
+				int insert_index;
+			};
+
+			int get_scripts(lua_State* L)
+			{
+				scan_context ctx{ L, lua_gettop(L) + 1, 0 };
+				lua_newtable(L);
+
+				auto original_threshold = L->global->GCthreshold;
+				L->global->GCthreshold = SIZE_MAX;
+
+				luaM_visitgco(L, &ctx, [](void* userdata, lua_Page* page, GCObject* obj) -> bool {
+					auto* sctx = static_cast<scan_context*>(userdata);
+
+					if (isdead(sctx->thread->global, obj))
+						return false;
+
+					if (obj->gch.tt != LUA_TUSERDATA)
+						return true;
+
+					TValue* top = sctx->thread->top++;
+					top->tt = LUA_TUSERDATA;
+					top->value.p = reinterpret_cast<void*>(obj);
+
+					if (strcmp(luaL_typename(sctx->thread, -1), "Instance") != 0) {
+						lua_pop(sctx->thread, 1);
+						return true;
+					}
+
+					lua_getfield(sctx->thread, -1, "ClassName");
+					const char* classname = lua_tostring(sctx->thread, -1);
+
+					bool is_script = classname &&
+						(!strcmp(classname, "LocalScript") ||
+							!strcmp(classname, "ModuleScript") ||
+							!strcmp(classname, "CoreScript") ||
+							!strcmp(classname, "Script"));
+
+					if (is_script) {
+						lua_pop(sctx->thread, 1);
+						sctx->insert_index++;
+						lua_rawseti(sctx->thread, sctx->result_index, sctx->insert_index);
+					}
+					else {
+						lua_pop(sctx->thread, 2);
+					}
+
+					return true;
+					});
+
+				L->global->GCthreshold = original_threshold;
+				return 1;
+			}
+
+			int getclipboard(lua_State* LS) {
+				// Apri gli appunti
+				if (!OpenClipboard(nullptr)) {
+					lua_pushnil(LS);
+					return 1;
+				}
+
+				// Ottieni il dato di tipo testo
+				HANDLE hData = GetClipboardData(CF_TEXT);
+				if (hData == nullptr) {
+					CloseClipboard();
+					lua_pushnil(LS);
+					return 1;
+				}
+
+				// Blocca la memoria per leggere il testo
+				char* pszText = static_cast<char*>(GlobalLock(hData));
+				if (pszText == nullptr) {
+					CloseClipboard();
+					lua_pushnil(LS);
+					return 1;
+				}
+
+				// Copia il testo
+				std::string clipboardText = pszText;
+
+				// Libera la memoria e chiude gli appunti
+				GlobalUnlock(hData);
+				CloseClipboard();
+
+				// Pusha la stringa in Lua
+				lua_pushstring(LS, clipboardText.c_str());
+				return 1;
+			}
+
+			int get_hui(lua_State* LS)
+			{
+				lua_getglobal(LS, "__hiddeninterface");
+
+				return 1;
+			};
+
+			namespace Filesystem {
+				static std::filesystem::path a = getenv("LOCALAPPDATA");
+				static std::filesystem::path b = a / "Cravex";
+				static std::filesystem::path c = b / "workspace";
+
+				std::string getWorkspaceFolder() {
+					if (!std::filesystem::exists(c)) {
+						std::filesystem::create_directories(c);
+					}
+
+					return c.string() + "\\";
+				};
+
+				void _SplitString(std::string Str, std::string By, std::vector<std::string>& Tokens)
+				{
+					Tokens.push_back(Str);
+					const auto splitLen = By.size();
+					while (true)
+					{
+						auto frag = Tokens.back();
+						const auto splitAt = frag.find(By);
+						if (splitAt == std::string::npos)
+							break;
+						Tokens.back() = frag.substr(0, splitAt);
+						Tokens.push_back(frag.substr(splitAt + splitLen, frag.size() - (splitAt + splitLen)));
+					}
+				}
+
+				int makefolder(lua_State* L) {
+					//("makefolder");
+
+					luaL_checktype(L, 1, LUA_TSTRING);
+
+					std::string Path = luaL_checklstring(L, 1, 0);
+
+					std::replace(Path.begin(), Path.end(), '\\', '/');
+					std::vector<std::string> Tokens;
+					_SplitString(Path, "/", Tokens);
+
+					std::string CurrentPath = getWorkspaceFolder();
+					std::replace(CurrentPath.begin(), CurrentPath.end(), '\\', '/');
+
+					for (const auto& Token : Tokens) {
+						CurrentPath += Token + "/";
+
+						if (!std::filesystem::is_directory(CurrentPath))
+							std::filesystem::create_directory(CurrentPath);
+					}
+
+					return 0;
+				};
+
+				int isfile(lua_State* L) {
+					//("isfile");
+
+					luaL_checktype(L, 1, LUA_TSTRING);
+
+					std::string Path = luaL_checklstring(L, 1, 0);
+
+					std::string FullPath = getWorkspaceFolder() + Path;
+					std::replace(FullPath.begin(), FullPath.end(), '\\', '/');
+
+					lua_pushboolean(L, std::filesystem::is_regular_file(FullPath));
+					return 1;
+				};
+
+				int readfile(lua_State* L) {
+					//("readfile");
+
+					luaL_checktype(L, 1, LUA_TSTRING);
+
+					std::string Path = luaL_checklstring(L, 1, 0);
+
+					std::string FullPath = getWorkspaceFolder() + Path;
+					std::replace(FullPath.begin(), FullPath.end(), '\\', '/');
+
+					if (std::to_string(std::filesystem::is_regular_file(FullPath)) == "1")
+					{
+						std::ifstream File(FullPath, std::ios::binary);
+						if (!File)
+							luaL_error(L, "Failed to open file: %s", FullPath.c_str());
+
+						std::string Content((std::istreambuf_iterator<char>(File)), std::istreambuf_iterator<char>());
+						File.close();
+
+						lua_pushlstring(L, Content.data(), Content.size());
+						return 1;
+					}
+					else
+						luaL_error(L, "Failed to open file: %s", FullPath.c_str());
+
+					return 0;
+				}
+
+
+				int writefile(lua_State* L) {
+					//("writefile");
+
+					luaL_checktype(L, 1, LUA_TSTRING);
+					luaL_checktype(L, 2, LUA_TSTRING);
+
+					size_t contentSize = 0;
+					std::string Path = luaL_checklstring(L, 1, 0);
+					const auto Content = luaL_checklstring(L, 2, &contentSize);
+
+					std::replace(Path.begin(), Path.end(), '\\', '/');
+
+					std::vector<std::string> DisallowedExtensions =
+					{
+						".exe", ".scr", ".bat", ".com", ".csh", ".msi", ".vb", ".vbs", ".vbe", ".ws", ".wsf", ".wsh", ".ps1"
+					};
+
+					for (std::string Extension : DisallowedExtensions) {
+						if (Path.find(Extension) != std::string::npos) {
+							luaL_error(L, ("forbidden file extension"));
+						}
+					}
+
+					std::string FullPath = getWorkspaceFolder() + Path;
+					std::replace(FullPath.begin(), FullPath.end(), '\\', '/');
+					//(FullPath);
+					std::ofstream fileToWrite(FullPath, std::ios::beg | std::ios::binary);
+					fileToWrite.write(Content, contentSize);
+					fileToWrite.close();
+
+					return 0;
+				};
+
+				int listfiles(lua_State* L) {
+					//("listfiles");
+
+					luaL_checktype(L, 1, LUA_TSTRING);
+
+					std::string Path = luaL_checklstring(L, 1, 0);
+
+					std::string FullPath = getWorkspaceFolder() + Path;
+					std::replace(FullPath.begin(), FullPath.end(), '\\', '/');
+					std::string halfPath = getWorkspaceFolder();
+					std::string workspace = ("\\Workspace\\");
+
+					if (!std::filesystem::is_directory(FullPath))
+						luaL_error(L, ("folder does not exist"));
+
+					lua_createtable(L, 0, 0);
+					int i = 1;
+					for (const auto& entry : std::filesystem::directory_iterator(FullPath)) {
+						std::string path = entry.path().string().substr(halfPath.length());
+
+						lua_pushinteger(L, i);
+						lua_pushstring(L, path.c_str());
+						lua_settable(L, -3);
+						i++;
+					}
+
+					return 1;
+				};
+
+				int isfolder(lua_State* L) {
+					//("isfolder");
+
+					luaL_checktype(L, 1, LUA_TSTRING);
+
+					std::string Path = luaL_checklstring(L, 1, 0);
+
+					std::string FullPath = getWorkspaceFolder() + Path;
+					std::replace(FullPath.begin(), FullPath.end(), '\\', '/');
+
+					lua_pushboolean(L, std::filesystem::is_directory(FullPath));
+
+					return 1;
+				};
+
+				int delfolder(lua_State* L) {
+					//("delfolder");
+
+					luaL_checktype(L, 1, LUA_TSTRING);
+
+					std::string Path = luaL_checklstring(L, 1, 0);
+
+					std::string FullPath = getWorkspaceFolder() + Path;
+					std::replace(FullPath.begin(), FullPath.end(), '\\', '/');
+
+					if (!std::filesystem::remove_all(FullPath))
+						luaL_error(L, ("folder does not exist"));
+
+					return 0;
+				};
+
+				int delfile(lua_State* L) {
+					//("delfile");
+
+					luaL_checktype(L, 1, LUA_TSTRING);
+
+					std::string Path = luaL_checklstring(L, 1, 0);
+
+					std::string FullPath = getWorkspaceFolder() + Path;
+					std::replace(FullPath.begin(), FullPath.end(), '\\', '/');
+
+					if (!std::filesystem::remove(FullPath))
+						luaL_error(L, ("file does not exist"));
+
+					return 0;
+				};
+
+				int loadfile(lua_State* L) {
+					//("loadfile");
+
+					luaL_checktype(L, 1, LUA_TSTRING);
+
+					std::string Path = luaL_checklstring(L, 1, 0);
+
+					std::string FullPath = getWorkspaceFolder() + Path;
+					std::replace(FullPath.begin(), FullPath.end(), '\\', '/');
+
+					if (!std::filesystem::is_regular_file(FullPath))
+						luaL_error(L, ("file does not exist"));
+
+					std::ifstream File(FullPath);
+					std::string Content((std::istreambuf_iterator<char>(File)), std::istreambuf_iterator<char>());
+					File.close();
+
+					lua_pop(L, lua_gettop(L));
+
+					lua_pushlstring(L, Content.data(), Content.size());
+
+					return load_string(L);
+				};
+
+				int appendfile(lua_State* L) {
+					//("appendfile");
+
+					luaL_checktype(L, 1, LUA_TSTRING);
+					luaL_checktype(L, 2, LUA_TSTRING);
+
+					size_t contentSize = 0;
+					std::string Path = luaL_checklstring(L, 1, 0);
+					const auto Content = luaL_checklstring(L, 2, &contentSize);
+
+					std::replace(Path.begin(), Path.end(), '\\', '/');
+
+					std::string FullPath = getWorkspaceFolder() + Path;
+					std::replace(FullPath.begin(), FullPath.end(), '\\', '/');
+
+					std::ofstream fileToWrite(FullPath, std::ios::binary | std::ios::app);
+					fileToWrite << Content;
+					fileToWrite.close();
+
+					return 0;
+				};
+
+				int getcustomasset(lua_State* L) {
+					//("getcustomasset");
+
+					luaL_checktype(L, 1, LUA_TSTRING);
+					std::string assetPath = lua_tostring(L, 1);
+
+					std::string fullPathStr = (getWorkspaceFolder() + assetPath);
+					std::replace(fullPathStr.begin(), fullPathStr.end(), '\\', '/');
+					std::filesystem::path FullPath = fullPathStr;
+
+					if (!std::filesystem::is_regular_file(FullPath))
+						luaL_error(L, ("Failed to find local asset!"));
+
+					std::filesystem::path customAssetsDir = std::filesystem::current_path() / "ExtraContent" / "Cravex";
+					std::filesystem::path customAssetsFile = std::filesystem::current_path() / "ExtraContent" / "Cravex" / FullPath.filename();
+
+					if (!std::filesystem::exists(customAssetsDir))
+						std::filesystem::create_directory(customAssetsDir);
+
+					std::filesystem::copy_file(FullPath, customAssetsFile, std::filesystem::copy_options::update_existing);
+
+					std::string Final = "rbxasset://Cravex/" + customAssetsFile.filename().string();
+					lua_pushlstring(L, Final.c_str(), Final.size());
+					return 1;
+				}
+			}
+
+			int getgenv(lua_State* LS) {
+				lua_pushvalue(LS, LUA_ENVIRONINDEX);
+				return 1;
+			}
+
+			int getreg(lua_State* L) {
+				lua_pushvalue(L, LUA_REGISTRYINDEX);
+
+				return 1;
+			}
+
+			int getrenv(lua_State* L) {
+				const auto RobloxState = L->global->mainthread;
+
+				if (!RobloxState->isactive)
+					luaC_threadbarrier(RobloxState);
+
+				lua_pushvalue(RobloxState, LUA_GLOBALSINDEX);
+				lua_xmove(RobloxState, L, 1);
+
+				lua_normalisestack(L, 0);
+				lua_preparepushcollectable(L, 2);
+				lua_createtable(L, 2, 2);
+				lua_rawgeti(L, LUA_REGISTRYINDEX, 2);
+				lua_setfield(L, -2, "_G");
+				lua_rawgeti(L, LUA_REGISTRYINDEX, 4);
+				lua_setfield(L, -2, "shared");
+
+				return 1;
+			}
+
+			int hookmetamethod(lua_State* LS) {
+				//("hookmetamethod");
+
+				luaL_checkany(LS, 1);
+				luaL_checkstring(LS, 2);
+				luaL_checkany(LS, 3);
+
+				if (!lua_getmetatable(LS, 1)) {
+					lua_pushnil(LS);
+					return 1;
+				}
+
+				int Table = lua_gettop(LS);
+				const char* Method = lua_tostring(LS, 2);
+				if (!IsMetamethod(Method))
+					return 0;
+
+				auto OldReadOnly = lua_getreadonly(LS, 1);
+
+				lua_getfield(LS, Table, Method);
+				lua_pushvalue(LS, -1);
+
+				lua_setreadonly(LS, Table, false);
+
+				lua_pushvalue(LS, 3);
+				lua_setfield(LS, Table, Method);
+
+				lua_setreadonly(LS, Table, OldReadOnly);
+
+				lua_remove(LS, Table);
+
+				return 1;
+			}
+
+			int isreadonly(lua_State* LS) {
+				//("isreadonly");
+
+				lua_pushboolean(LS, lua_getreadonly(LS, 1));
+				return 1;
+			};
+
+			int setrawmetatable(lua_State* LS) {
+				//("setrawmetatable");
+
+				luaL_argexpected(LS, lua_istable(LS, 1) || lua_islightuserdata(LS, 1) || lua_isuserdata(LS, 1) || lua_isbuffer(LS, 1) || lua_isvector(LS, 1), 1, "Expected a table or an userdata or a buffer or a vector");
+
+				luaL_argexpected(LS, lua_istable(LS, 2) || lua_isnil(LS, 2), 2, "Expected table or nil");
+
+				const bool OldState = lua_getreadonly(LS, 1);
+
+				lua_setreadonly(LS, 1, false);
+
+				lua_setmetatable(LS, 1);
+
+				lua_setreadonly(LS, 1, OldState);
+
+				lua_ref(LS, 1);
+
+				return 1;
+			};
+
+			int getrawmetatable(lua_State* LS) {
+				//("getrawmetatable");
+
+				luaL_checkany(LS, 1);
+
+				if (!lua_getmetatable(LS, 1))
+					lua_pushnil(LS);
+
+				return 1;
+			};
+
+			int setreadonly(lua_State* LS) {
+				//("setreadonly");
+
+				luaL_checktype(LS, 1, LUA_TTABLE);
+				luaL_checktype(LS, 2, LUA_TBOOLEAN);
+
+				lua_setreadonly(LS, 1, lua_toboolean(LS, 2));
+
+				return 0;
+			};
+
+			int getinstances(lua_State* LS) {
+				//("getinstances");
+
+				lua_pop(LS, lua_gettop(LS));
+
+				GetEveryInstance(LS);
+
+				if (!lua_istable(LS, -1)) { lua_pop(LS, 1); lua_pushnil(LS); return 1; };
+
+				lua_newtable(LS);
+
+				int index = 0;
+
+				lua_pushnil(LS);
+				while (lua_next(LS, -3) != 0) {
+
+					if (!lua_isnil(LS, -1)) {
+						lua_getglobal(LS, "typeof");
+						lua_pushvalue(LS, -2);
+						lua_pcall(LS, 1, 1, 0);
+
+						std::string type = lua_tostring(LS, -1);
+						lua_pop(LS, 1);
+
+						if (type == "Instance") {
+							lua_pushinteger(LS, ++index);
+
+							lua_pushvalue(LS, -2);
+							lua_settable(LS, -5);
+						}
+					}
+
+					lua_pop(LS, 1);
+				}
+
+				lua_remove(LS, -2);
+
+				return 1;
+			};
+
+			int getnilinstances(lua_State* LS)
+			{
+				//("getnilinstances");
+
+				lua_pop(LS, lua_gettop(LS));
+
+				GetEveryInstance(LS);
+
+				if (!lua_istable(LS, -1)) { lua_pop(LS, 1); lua_pushnil(LS); return 1; };
+
+				lua_newtable(LS);
+
+				int index = 0;
+
+				lua_pushnil(LS);
+				while (lua_next(LS, -3) != 0) {
+
+					if (!lua_isnil(LS, -1)) {
+						lua_getglobal(LS, "typeof");
+						lua_pushvalue(LS, -2);
+						lua_pcall(LS, 1, 1, 0);
+
+						std::string type = lua_tostring(LS, -1);
+						lua_pop(LS, 1);
+
+						if (type == "Instance") {
+							lua_getfield(LS, -1, "Parent");
+							int parentType = lua_type(LS, -1);
+							lua_pop(LS, 1);
+
+							if (parentType == LUA_TNIL) {
+								lua_pushinteger(LS, ++index);
+
+								lua_pushvalue(LS, -2);
+								lua_settable(LS, -5);
+							}
+						}
+					}
+
+					lua_pop(LS, 1);
+				}
+
+				lua_remove(LS, -2);
+
+				return 1;
+			};
+
+			int getgc(lua_State* LS) {
+				//("getgc");
+
+				const bool includeTables = luaL_optboolean(LS, 1, false);
+
+				lua_newtable(LS);
+				lua_newtable(LS);
+
+				lua_pushstring(LS, "kvs");
+				lua_setfield(LS, -2, "__mode");
+				lua_setmetatable(LS, -2);
+
+				typedef struct {
+					lua_State* luaThread;
+					bool includeTables;
+					int itemsFound;
+				} GCOContext;
+
+				auto GCContext = GCOContext{ LS, includeTables, 0 };
+
+				const auto oldGCThreshold = LS->global->GCthreshold;
+				LS->global->GCthreshold = SIZE_MAX;
+
+				luaM_visitgco(LS, &GCContext, [](void* ctx, lua_Page* page, GCObject* gcObj) -> bool {
+					const auto context = static_cast<GCOContext*>(ctx);
+					const auto luaThread = context->luaThread;
+
+					if (isdead(luaThread->global, gcObj))
+						return false;
+
+					const auto gcObjectType = gcObj->gch.tt;
+					if (gcObjectType == LUA_TFUNCTION || gcObjectType == LUA_TTHREAD || gcObjectType == LUA_TUSERDATA ||
+						gcObjectType == LUA_TLIGHTUSERDATA ||
+						gcObjectType == LUA_TBUFFER || gcObjectType == LUA_TTABLE && context->includeTables) {
+						luaThread->top->value.gc = gcObj;
+						luaThread->top->tt = gcObjectType;
+						incr_top(luaThread);
+
+						const auto newTableIndex = context->itemsFound++;
+						lua_rawseti(luaThread, -2, newTableIndex);
+					}
+
+					return false;
+					});
+
+				LS->global->GCthreshold = oldGCThreshold;
+
+				return 1;
+			};
+
+			int getnamecallmethod(lua_State* LS) {
+				//("getnamecallmethod");
+
+				auto Namecall = lua_namecallatom(LS, nullptr);
+				if (Namecall == nullptr)
+					lua_pushnil(LS);
+				else
+					lua_pushstring(LS, Namecall);
+
+				return 1;
+			};
+
+			int checkcaller(lua_State* LS)
+			{
+				//("checkcaller");
+
+				const auto script_ptr = *(std::uintptr_t*)((std::uintptr_t)((LS->userdata)) + 0x50);
+
+				lua_pushboolean(LS, !script_ptr);
+				return 1;
+			};
+
+			int getrunningscripts(lua_State* LS) {
+				//("getrunningscripts");
+
+				lua_newtable(LS);
+
+				typedef struct {
+					lua_State* State;
+					int itemsFound;
+					std::map< uintptr_t, bool > map;
+				} GCOContext;
+
+				auto gcCtx = GCOContext{ LS, 0 };
+
+				const auto ullOldThreshold = LS->global->GCthreshold;
+				LS->global->GCthreshold = SIZE_MAX;
+
+				luaM_visitgco(LS, &gcCtx, [](void* ctx, lua_Page* pPage, GCObject* pGcObj) -> bool {
+					const auto pCtx = static_cast<GCOContext*>(ctx);
+					const auto ctxL = pCtx->State;
+
+					if (isdead(ctxL->global, pGcObj))
+						return false;
+
+					if (const auto gcObjType = pGcObj->gch.tt;
+						gcObjType == LUA_TFUNCTION) {
+						ctxL->top->value.gc = pGcObj;
+						ctxL->top->tt = gcObjType;
+						ctxL->top++;
+
+						lua_getfenv(ctxL, -1);
+
+						if (!lua_isnil(ctxL, -1)) {
+							lua_getfield(ctxL, -1, "script");
+
+							if (!lua_isnil(ctxL, -1)) {
+								uintptr_t Script = *(uintptr_t*)lua_touserdata(ctxL, -1);
+
+								std::string ClassName = **(std::string**)(*(uintptr_t*)(Script + update::offsets::datamodel::ClassDescriptor) + update::offsets::datamodel::ClassName);
+
+								if (pCtx->map.find(Script) == pCtx->map.end() && (ClassName == "LocalScript" || ClassName == "ModuleScript" || ClassName == "Script")) {
+									pCtx->map.insert({ Script, true });
+									lua_rawseti(ctxL, -4, ++pCtx->itemsFound);
+								}
+								else {
+									lua_pop(ctxL, 1);
+								}
+							}
+							else {
+								lua_pop(ctxL, 1);
+							}
+						}
+
+						lua_pop(ctxL, 2);
+					}
+					return false;
+					});
+
+				LS->global->GCthreshold = ullOldThreshold;
+
+				return 1;
+			};
+
+			int compareinstances(lua_State* LS) {
+				//("compareinstances");
+
+				luaL_checktype(LS, 1, LUA_TUSERDATA);
+				luaL_checktype(LS, 2, LUA_TUSERDATA);
+
+				IsInstance(LS, 1);
+				IsInstance(LS, 2);
+
+				uintptr_t First = *reinterpret_cast<uintptr_t*>(lua_touserdata(LS, 1));
+				if (!First)
+					luaL_argerrorL(LS, 1, "Invalid instance");
+
+				uintptr_t Second = *reinterpret_cast<uintptr_t*>(lua_touserdata(LS, 2));
+				if (!Second)
+					luaL_argerrorL(LS, 2, "Invalid instance");
+
+				if (First == Second)
+					lua_pushboolean(LS, true);
+				else
+					lua_pushboolean(LS, false);
+
+				return 1;
+			};
+
+			int firetouchinterest(lua_State* LS) {
+				//("firetouchinterest");
+
+				luaL_checktype(LS, 1, LUA_TUSERDATA);
+				luaL_checktype(LS, 2, LUA_TUSERDATA);
+				//luaL_checktype(LS, 3, LUA_TNUMBER);
+
+				int Toggle = lua_tonumber(LS, 3);
+
+				uintptr_t BasePart = *reinterpret_cast<uintptr_t*>(lua_touserdata(LS, 1));
+				if (!BasePart)
+					luaL_argerror(LS, 1, "Invalid basepart");
+
+				uintptr_t BasePartTouch = *reinterpret_cast<uintptr_t*>(lua_touserdata(LS, 2));
+				if (!BasePartTouch)
+					luaL_argerror(LS, 2, "Invalid basepart");
+
+				uintptr_t Touch1 = *reinterpret_cast<uintptr_t*>(BasePart + update::offsets::datamodel::PrimitiveTouch);
+				if (!Touch1)
+					luaL_argerror(LS, 1, "Error getting primitive touch");
+
+				uintptr_t Touch2 = *reinterpret_cast<uintptr_t*>(BasePartTouch + update::offsets::datamodel::PrimitiveTouch);
+				if (!Touch2)
+					luaL_argerror(LS, 2, "Error getting primitive touch");
+
+				uintptr_t Overlap = *reinterpret_cast<uintptr_t*>(Touch1 + update::offsets::datamodel::Overlap);
+				if (!Overlap)
+					luaL_argerror(LS, 1, "Error getting overlap");
+
+				Roblox::FireTouchInterest(Overlap, Touch1, Touch2, Toggle, true);
+			};
+
+			int fireclickdetector(lua_State* L) {
+				luaL_checktype(L, 1, LUA_TUSERDATA);
+
+				std::string clickOption = lua_isstring(L, 3) ? lua_tostring(L, 3) : "";
+
+				if (strcmp(luaL_typename(L, 1), "Instance") != 0)
+				{
+					luaL_typeerror(L, 1, "Instance");
+					return 0;
+				}
+
+				const auto clickDetector = *reinterpret_cast<uintptr_t*>(lua_touserdata(L, 1));
+
+				float distance = 0.0;
+
+				if (lua_isnumber(L, 2))
+					distance = (float)lua_tonumber(L, 2);
+
+				lua_getglobal(L, "game");
+				lua_getfield(L, -1, "GetService");
+				lua_insert(L, -2);
+				lua_pushstring(L, "Players");
+				lua_pcall(L, 2, 1, 0);
+
+				lua_getfield(L, -1, "LocalPlayer");
+
+				const auto localPlayer = *reinterpret_cast<uintptr_t*>(lua_touserdata(L, -1));
+
+				std::transform(clickOption.begin(), clickOption.end(), clickOption.begin(), ::tolower);
+
+				if (clickOption == "rightmouseclick")
+					Roblox::FireRightMouseClick(clickDetector, distance, localPlayer);
+				else if (clickOption == "mousehoverenter")
+					Roblox::FireMouseHoverEnter(clickDetector, localPlayer);
+				else if (clickOption == "mousehoverleave")
+					Roblox::FireMouseHoverLeave(clickDetector, localPlayer);
+				else
+					Roblox::FireMouseClick(clickDetector, distance, localPlayer);
+				return 0;
+			}
+
+			int getthreadidentity(lua_State* LS) {
+				//("getthreadidentity");
+
+				lua_pushnumber(LS, LS->userdata->Identity);
+
+				return 1;
+			}
+
+			int setthreadidentity(lua_State* LS)
+			{
+				//("setthreadidentity");
+
+				luaL_checktype(LS, 1, LUA_TNUMBER);
+
+				SetNewIdentity(LS, lua_tonumber(LS, 1));
+
+				return 0;
+			}
+
+			int cloneref(lua_State* LS) {
+				//("cloneref");
+
+				luaL_checktype(LS, 1, LUA_TUSERDATA);
+
+				IsInstance(LS, 1);
+
+				const auto OldUserdata = lua_touserdata(LS, 1);
+
+				const auto NewUserdata = *reinterpret_cast<uintptr_t*>(OldUserdata);
+
+				lua_pushlightuserdata(LS, (void*)Roblox::PushInstance);
+
+				lua_rawget(LS, -10000);
+				lua_pushlightuserdata(LS, reinterpret_cast<void*>(NewUserdata));
+				lua_rawget(LS, -2);
+
+				lua_pushlightuserdata(LS, reinterpret_cast<void*>(NewUserdata));
+				lua_pushnil(LS);
+				lua_rawset(LS, -4);
+
+				Roblox::PushInstance(LS, (uintptr_t)OldUserdata);
+
+				lua_pushlightuserdata(LS, reinterpret_cast<void*>(NewUserdata));
+				lua_pushvalue(LS, -3);
+				lua_rawset(LS, -5);
+
+				return 1;
+			};
+
+			static const luaL_Reg functions[] = {
+				{"loadstring", load_string},
+				{"identifyexecutor", identify_executor},
+				{"httpget", http::httpget},
+
+				{"getgenv", getgenv},
+				{"gethui", get_hui},
+				{"getrenv", getrenv},
+				{"getgc", getgc},
+				//{"getscripts", get_scripts}, // i will recode this later or whatever since it gets all corescripts by default
+
+				{"checkcaller", checkcaller},
+
+				//{"clonefunction", clonefunction},
+				{"cloneref", cloneref},
+
+				//{"request", request},
+
+				{"getinstances", getinstances},
+				{"getnilinstances", getnilinstances},
+				{"getrunningscripts", getrunningscripts},
+
+				{"firetouchinterest", firetouchinterest},
+				//{"fireclickdetector", fireclickdetector},
+
+				{"compareinstances", compareinstances},
+
+				{"getclipboard", getclipboard},
+				{"setclipboard", setclipboard},
+
+				{"hookmetamethod", hookmetamethod},
+				{"getnamecallmethod", getnamecallmethod},
+
+				{"isreadonly", isreadonly},
+				{"setreadonly", setreadonly},
+
+				{"setrawmetatable", setrawmetatable},
+				{"getrawmetatable", getrawmetatable},
+
+				{"writefile", Filesystem::writefile},
+				{"isfolder", Filesystem::isfolder},
+				{"readfile", Filesystem::readfile},
+				{"makefolder", Filesystem::makefolder},
+				{"appendfile", Filesystem::appendfile},
+				{"isfile", Filesystem::isfile},
+				{"loadfile", Filesystem::loadfile},
+				{"delfile", Filesystem::delfile},
+				{"delfolder", Filesystem::delfolder},
+				{"getcustomasset", Filesystem::getcustomasset},
+				{"listfiles", Filesystem::listfiles},
+				{nullptr, nullptr}
+			};
+		}
+
+		namespace Debug {
+			int getreg(lua_State* LS) {
+				//("getreg");
+
+				lua_pushvalue(LS, LUA_REGISTRYINDEX);
+				return 1;
+			};
+
+			int getinfo(lua_State* L) {
+				//("debug.getinfo");
+
+				luaL_trimstack(L, 1);
+				luaL_argexpected(L, lua_isnumber(L, 1) || lua_isfunction(L, 1), 1, "function or level");
+
+				auto infoLevel = 0;
+				if (lua_isnumber(L, 1)) {
+					infoLevel = lua_tointeger(L, 1);
+					luaL_argcheck(L, infoLevel >= 0, 1, "level cannot be negative");
+				}
+				else if (lua_isfunction(L, 1)) {
+					infoLevel = -lua_gettop(L);
+				}
+
+				lua_Debug debugInfo{};
+				if (!lua_getinfo(L, infoLevel, "fulasnf", &debugInfo))
+					luaL_argerrorL(L, 1, "invalid level");
+
+				lua_newtable(L);
+
+				lua_pushvalue(L, -2);
+				lua_setfield(L, -2, "func");
+
+				lua_pushstring(L, debugInfo.source);
+				lua_setfield(L, -2, "source");
+
+				lua_pushstring(L, debugInfo.short_src);
+				lua_setfield(L, -2, "short_src");
+
+				lua_pushstring(L, debugInfo.what);
+				lua_setfield(L, -2, "what");
+
+				lua_pushinteger(L, debugInfo.currentline);
+				lua_setfield(L, -2, "currentline");
+
+				lua_pushstring(L, debugInfo.name);
+				lua_setfield(L, -2, "name");
+
+				lua_pushinteger(L, debugInfo.nupvals);
+				lua_setfield(L, -2, "nups");
+
+				lua_pushinteger(L, debugInfo.nparams);
+				lua_setfield(L, -2, "numparams");
+
+				lua_pushinteger(L, debugInfo.isvararg);
+				lua_setfield(L, -2, "is_vararg");
+
+				return 1;
+			}
+
+			__forceinline void convert_level_or_function_to_closure(lua_State* L, const char* cFunctionErrorMessage,
+				const bool shouldErrorOnCFunction = true) {
+				luaL_checkany(L, 1);
+
+				if (lua_isnumber(L, 1)) {
+					lua_Debug debugInfo{};
+					const auto level = lua_tointeger(L, 1);
+
+					if (level < 0 || level > 255)
+						luaL_argerrorL(L, 1, "level out of bounds");
+
+					if (!lua_getinfo(L, level, "f", &debugInfo))
+						luaL_argerrorL(L, 1, "invalid level");
+				}
+				else if (lua_isfunction(L, 1)) {
+					lua_pushvalue(L, 1);
+				}
+				else {
+					luaL_argerrorL(L, 1, "level or function expected");
+				}
+
+				if (!lua_isfunction(L, -1))
+					luaG_runerrorL(L, "There isn't function on stack");
+
+				if (shouldErrorOnCFunction && lua_iscfunction(L, -1))
+					luaL_argerrorL(L, 1, cFunctionErrorMessage);
+			}
+
+			int getconstants(lua_State* L) {
+				//("debug.getconstants");
+
+				luaL_trimstack(L, 1);
+				convert_level_or_function_to_closure(L, "Cannot get constants from C closure");
+
+				// Do not touch this unless if you want to die
+				const auto closure = lua_toclosure(L, -1);
+				lua_createtable(L, closure->l.p->sizek, 0);
+
+				for (int i = 0; i < closure->l.p->sizek; i++) {
+					auto&& constant = &closure->l.p->k[i];
+
+					if (constant->tt != LUA_TFUNCTION && constant->tt != LUA_TTABLE) {
+						setobj(L, L->top, constant);
+						incr_top(L);
+					}
+					else {
+						lua_pushnil(L);
+					}
+
+					lua_rawseti(L, -2, (i + 1));
+				}
+
+				return 1;
+			}
+
+			int getconstant(lua_State* L) {
+				//("debug.getconstant");
+
+				luaL_trimstack(L, 2);
+				luaL_checktype(L, 2, LUA_TNUMBER);
+				convert_level_or_function_to_closure(L, "Cannot get constants from C closure");
+
+				const auto constantIndex = lua_tointeger(L, 2);
+				const auto closure = lua_toclosure(L, -1);
+				Proto* p = (Proto*)closure->l.p;
+
+				if ((int)p->sizek == 0)
+				{
+					luaL_argerror(L, 1, ("Function doesn't has constants."));
+				}
+
+				if (!(constantIndex >= 1 && constantIndex <= p->sizek))
+				{
+					luaL_argerror(L, 2, ("Index out of range."));
+				}
+
+				TValue k = (TValue)p->k[constantIndex - 1];
+
+				if (k.tt == LUA_TFUNCTION || k.tt == LUA_TTABLE)
+				{
+					lua_pushnil(L);
+				}
+				else
+				{
+					luaC_threadbarrier(L) luaA_pushobject(L, &k);
+				}
+				return 1;
+			}
+
+			int setconstant(lua_State* L) {
+				//("debug.setconstant");
+
+				luaL_trimstack(L, 3);
+				luaL_checktype(L, 2, LUA_TNUMBER);
+				luaL_argexpected(L, lua_isnumber(L, 3) || lua_isboolean(L, 3) || lua_isstring(L, 3), 3,
+					"number or boolean or string");
+				convert_level_or_function_to_closure(L, "Cannot set constants on a C closure");
+
+				const auto constantIndex = lua_tointeger(L, 2);
+				const auto closure = lua_toclosure(L, -1);
+
+				luaL_argcheck(L, constantIndex > 0, 2, "index cannot be negative");
+				luaL_argcheck(L, constantIndex <= closure->l.p->sizek, 3, "index out of range");
+
+				setobj(L, &closure->l.p->k[constantIndex - 1], index2addr(L, 3))
+
+					return 0;
+			}
+
+			int getupvalues(lua_State* L) {
+				//("debug.getupvalues");
+
+				luaL_trimstack(L, 1);
+				convert_level_or_function_to_closure(L, "Cannot get upvalues on C Closures", true);
+
+				const auto closure = lua_toclosure(L, -1);
+				lua_newtable(L);
+
+				lua_pushrawclosure(L, closure);
+				for (int i = 0; i < closure->nupvalues;) {
+					lua_getupvalue(L, -1, ++i);
+					lua_rawseti(L, -3, i);
+				}
+
+				lua_pop(L, 1);
+				return 1;
+			}
+
+			int getupvalue(lua_State* L) {
+				//("debug.getupvalue");
+
+				luaL_trimstack(L, 2);
+				luaL_checktype(L, 2, LUA_TNUMBER);
+				convert_level_or_function_to_closure(L, "Cannot get upvalue on C Closures", true);
+
+				const auto upvalueIndex = lua_tointeger(L, 2);
+				const auto closure = lua_toclosure(L, -1);
+
+				luaL_argcheck(L, upvalueIndex > 0, 2, "index cannot be negative");
+				luaL_argcheck(L, upvalueIndex <= closure->nupvalues, 2, "index out of range");
+
+				lua_pushrawclosure(L, closure);
+				lua_getupvalue(L, -1, upvalueIndex);
+
+				lua_remove(L, -2);
+				return 1;
+			}
+
+			int debug_setupvalue(lua_State* L) {
+				//("debug.setupvalue");
+
+				luaL_trimstack(L, 3);
+				luaL_checktype(L, 2, LUA_TNUMBER);
+				luaL_checkany(L, 3);
+				convert_level_or_function_to_closure(L, "Cannot set upvalue on C Closure", true);
+
+				const auto closure = lua_toclosure(L, -1);
+				const auto upvalueIndex = lua_tointeger(L, 2);
+				const auto objToSet = index2addr(L, 3);
+
+				luaL_argcheck(L, upvalueIndex > 0, 2, "index cannot be negative");
+				luaL_argcheck(L, upvalueIndex <= closure->nupvalues, 2, "index out of range");
+
+				setobj(L, &closure->l.uprefs[upvalueIndex - 1], objToSet);
+				return 0;
+			}
+
+			int getprotos(lua_State* L) {
+				//("debug.getprotos");
+
+				luaL_trimstack(L, 1);
+				convert_level_or_function_to_closure(L, "Cannot get protos on C Closure");
+
+				const auto closure = lua_toclosure(L, -1);
+				Proto* originalProto = closure->l.p;
+
+				lua_newtable(L);
+				for (int i = 0; i < originalProto->sizep;) {
+					const auto currentProto = originalProto->p[i];
+					lua_pushrawclosure(L, luaF_newLclosure(L, currentProto->nups, closure->env, currentProto));
+					lua_rawseti(L, -2, ++i);
+				}
+
+				return 1;
+			}
+
+			int getproto(lua_State* L) {
+				//("debug.getproto");
+
+				luaL_trimstack(L, 3);
+				const auto isActiveProto = luaL_optboolean(L, 3, false);
+				luaL_checktype(L, 2, LUA_TNUMBER);
+				convert_level_or_function_to_closure(L, "Cannot get proto on C Closure");
+
+				const auto protoIndex = lua_tointeger(L, 2);
+				const auto closure = lua_toclosure(L, -1);
+
+				luaL_argcheck(L, protoIndex > 0, 2, "index cannot be negative");
+				luaL_argcheck(L, protoIndex <= closure->l.p->sizep, 2, "index out of range");
+
+				auto proto = closure->l.p->p[protoIndex - 1];
+				if (isActiveProto) {
+					lua_newtable(L);
+					struct LookupContext {
+						lua_State* L;
+						int count;
+						Closure* closure;
+					} context{ L, 0, closure };
+
+					luaM_visitgco(L, &context, [](void* contextPointer, lua_Page* page, GCObject* gcObject) -> bool {
+						const auto context = static_cast<LookupContext*>(contextPointer);
+						if (isdead(context->L->global, gcObject))
+							return false;
+
+						if (gcObject->gch.tt == LUA_TFUNCTION) {
+							const auto closure = (Closure*)gcObject;
+							if (!closure->isC && closure->l.p == context->closure->l.p
+								->p[context->count]) {
+								setclvalue(context->L, context->L->top, closure);
+								incr_top(context->L);
+								lua_rawseti(context->L, -2, ++context->count);
+							}
+						}
+
+						return false;
+						});
+
+					return 1;
+				}
+
+				lua_pushrawclosure(L, luaF_newLclosure(L, proto->nups, closure->env, proto));
+				return 1;
+			}
+
+			int getstack(lua_State* L) {
+				//("debug.getstack");
+
+				luaL_checktype(L, 1, LUA_TNUMBER);
+				luaL_trimstack(L, 2);
+
+				const auto level = lua_tointeger(L, 1);
+				const auto index = (lua_isnoneornil(L, 2)) ? -1 : luaL_checkinteger(L, 2);
+
+				if (level >= (L->ci - L->base_ci) || level < 0)
+					luaL_argerrorL(L, 1, "level out of range");
+
+				if (index < -2 || index > 255)
+					luaL_argerrorL(L, 2, "index out of range");
+
+				const auto frame = L->ci - level;
+				if (!frame->func || !ttisfunction(frame->func))
+					luaL_argerrorL(L, 1, "invalid function in frame");
+
+				if (clvalue(frame->func)->isC)
+					luaL_argerrorL(L, 1, "level cannot point to a c closure");
+
+				if (!frame->top || !frame->base || frame->top < frame->base)
+					luaL_error(L, "invalid frame pointers");
+
+				const size_t stackFrameSize = frame->top - frame->base;
+
+				if (index == -1) {
+					lua_newtable(L);
+					for (int i = 0; i < stackFrameSize; i++) {
+						setobj2s(L, L->top, &frame->base[i]);
+						incr_top(L);
+
+						lua_rawseti(L, -2, i + 1);
+					}
+				}
+				else {
+					if (index < 1 || index > stackFrameSize)
+						luaL_argerrorL(L, 2, "index out of range");
+
+					setobj2s(L, L->top, &frame->base[index - 1]);
+					incr_top(L);
+				}
+
+				return 1;
+			}
+
+			int setstack(lua_State* L) {
+				//("debug.setstack");
+
+				luaL_trimstack(L, 3);
+				luaL_checktype(L, 1, LUA_TNUMBER);
+				luaL_checktype(L, 2, LUA_TNUMBER);
+				luaL_checkany(L, 3);
+
+				const auto level = lua_tointeger(L, 1);
+				const auto index = lua_tointeger(L, 2);
+
+				if (level >= L->ci - L->base_ci || level < 0)
+					luaL_argerrorL(L, 1, "level out of range");
+
+				const auto frame = L->ci - level;
+				const size_t top = frame->top - frame->base;
+
+				if (clvalue(frame->func)->isC)
+					luaL_argerrorL(L, 1, "level cannot point to a c closure");
+
+				if (index < 1 || index > top)
+					luaL_argerrorL(L, 2, "index out of range");
+
+				if (frame->base[index - 1].tt != lua_type(L, 3))
+					luaL_argerrorL(L, 3, "type of the value on the stack is different than the object you are setting it to");
+
+				setobj2s(L, &frame->base[index - 1], luaA_toobject(L, 3));
+				return 0;
+			}
+		};
+
+		namespace cache
+		{
+			void validate_instance(lua_State* L, int idx) 
+			{
+				const char* type_name = luaL_typename(L, idx);
+				if (!type_name || strcmp(type_name, "Instance") != 0)
+				{
+					luaL_typeerrorL(L, idx, "Instance");
+				}
+			}
+
+			int invalidate(lua_State* L)
+			{
+				//("invalidate");
+
+				luaL_checktype(L, 1, LUA_TUSERDATA);
+
+				IsInstance(L, 1);
+
+				const auto Instance = *static_cast<void**>(lua_touserdata(L, 1));
+
+				lua_pushlightuserdata(L, (void*)Roblox::PushInstance);
+				lua_gettable(L, LUA_REGISTRYINDEX);
+
+				lua_pushlightuserdata(L, reinterpret_cast<void*>(Instance));
+				lua_pushnil(L);
+				lua_settable(L, -3);
+
+				return 0;
+			}
+
+			int replace(lua_State* LS)
+			{
+				//("replace");
+
+				luaL_checktype(LS, 1, LUA_TUSERDATA);
+				luaL_checktype(LS, 2, LUA_TUSERDATA);
+
+				IsInstance(LS, 1);
+				IsInstance(LS, 2);
+
+				const auto Instance = *reinterpret_cast<uintptr_t*>(lua_touserdata(LS, 1));
+
+				lua_pushlightuserdata(LS, (void*)Roblox::PushInstance);
+				lua_gettable(LS, LUA_REGISTRYINDEX);
+
+				lua_pushlightuserdata(LS, (void*)Instance);
+				lua_pushvalue(LS, 2);
+				lua_settable(LS, -3);
+				return 0;
+			}
+
+			int is_cached(lua_State* LS)
+			{
+				//("iscached");
+
+				luaL_checktype(LS, 1, LUA_TUSERDATA);
+
+				IsInstance(LS, 1);
+				const auto Instance = *static_cast<void**>(lua_touserdata(LS, 1));
+
+				lua_pushlightuserdata(LS, (void*)Roblox::PushInstance);
+				lua_gettable(LS, LUA_REGISTRYINDEX);
+
+				lua_pushlightuserdata(LS, Instance);
+				lua_gettable(LS, -2);
+
+				lua_pushboolean(LS, !lua_isnil(LS, -1));
+				return 1;
+			}
+
+			int validate(lua_State* L)
+			{
+				luaL_checktype(L, 1, LUA_TUSERDATA);
+
+				void** userdata = static_cast<void**>(lua_touserdata(L, 1));
+				if (!userdata || !*userdata) {
+					lua_pushboolean(L, 0);
+					return 1;
+				}
+
+				void* raw_userdata = *userdata;
+
+				lua_pushlightuserdata(L, (void*)roblox::push_instance);
+				lua_rawget(L, LUA_REGISTRYINDEX);
+
+				lua_pushlightuserdata(L, raw_userdata);
+				lua_rawget(L, -2);
+
+				bool already_cached = lua_type(L, -1) != LUA_TNIL;
+				lua_pop(L, 1);
+
+				if (!already_cached) {
+					lua_pushlightuserdata(L, raw_userdata);
+					lua_pushvalue(L, 1);
+					lua_rawset(L, -3);
+				}
+
+				lua_pop(L, 1);
+
+				lua_pushboolean(L, 1);
+				return 1;
+			}
+
+			static const luaL_Reg functions[] = {
+					{"invalidate", invalidate},
+					{"validate", validate},
+					{"replace", replace},
+					{"iscached", is_cached},
+					{nullptr, nullptr}
+			};
+		}
+	}
+
+	namespace name_call
+	{
+		static __int64 old_namecall;
+		static __int64 old_index;
+
+		auto namecall_hook(lua_State* L) -> int
+		{
+			const auto script_ptr = *(std::uintptr_t*)((std::uintptr_t)(L->userdata) + 0x50);
+
+			if (L->namecall && !script_ptr)
+			{
+				const char* data = L->namecall->data;
+
+				if (!strcmp(data, "HttpGet") || !strcmp(data, "HttpGetAsync"))
+				{
+					return env::http::httpget(L);
+				}
+
+				if (!strcmp(data, "GetObjects") || !strcmp(data, "GetObjectsAsync"))
+				{
+					return env::http::get_objects(L);
+				}
+			}
+
+			return static_cast<int>(((__int64(__fastcall*)(__int64))old_namecall)((__int64)L));
+		}
+
+		auto index_hook(lua_State* L) -> int
+		{
+			auto state = (__int64)L;
+			const auto script_ptr = *(std::uintptr_t*)((std::uintptr_t)(L->userdata) + 0x50);
+
+			uintptr_t userdata = *(uintptr_t*)(state + 0x78);
+			int level = static_cast<int>(*(uintptr_t*)(userdata + 0x30));
+
+			if (lua_isstring(L, 2) && !script_ptr)
+			{
+				const char* data = luaL_checkstring(L, 2);
+
+				if (!strcmp(data, "HttpGet") || !strcmp(data, "HttpGetAsync"))
+				{
+					lua_getglobal(L, "httpget");
+					return 1;
+				}
+
+				if (!strcmp(data, "GetObjects") || !strcmp(data, "GetObjectsAsync"))
+				{
+					lua_getglobal(L, "getobjects");
+					return 1;
+				}
+			}
+
+			return static_cast<int>(((__int64(__fastcall*)(__int64))old_index)((__int64)L));
+		}
+
+		void initialize(lua_State* L)
+		{
+			lua_getglobal(L, "game");
+			lua_getmetatable(L, -1);
+			lua_getfield(L, -1, "__namecall");
+
+			Closure* namecall = (Closure*)lua_topointer(L, -1);
+			lua_CFunction namecall_f = namecall->c.f;
+			old_namecall = (__int64)namecall_f;
+			namecall->c.f = namecall_hook;
+
+			lua_settop(L, 0);
+
+			lua_getglobal(L, "game");
+			lua_getmetatable(L, -1);
+			lua_getfield(L, -1, "__index");
+
+			Closure* index = (Closure*)lua_topointer(L, -1);
+			lua_CFunction index_f = index->c.f;
+			old_index = (__int64)index_f;
+			index->c.f = index_hook;
+		}
+	}
+}
+
+
+static const luaL_Reg ScriptsFunctions[] = {
+	{"loadstring", CravexEnv::env::test::load_string},
+	{"getgenv", CravexEnv::env::test::getgenv},
+	{"gethui", CravexEnv::env::test::get_hui},
+	{"getrenv", CravexEnv::env::test::getrenv},
+	{"getgc", CravexEnv::env::test::getgc},
+	{"getreg", CravexEnv::env::test::getreg},
+
+	{nullptr, nullptr},
+};
+
+
+static const luaL_Reg MiscellaneousFunctions[] = {
+	{"identifyexecutor", Miscellaneous::identifyexecutor},
+	{"lz4compress", Miscellaneous::lz4compress},
+	{"lz4decompress", Miscellaneous::lz4decompress},
+	{"messagebox", Miscellaneous::messagebox},
+	{"queueonteleport", Miscellaneous::queueonteleport},
+	{"request", Miscellaneous::request},
+	{"httpget", CravexEnv::env::http::httpget},
+	{"getobjects", Miscellaneous::getobjects},
+	{"setclipboard", Miscellaneous::setclipboard},
+	//{"setfpscap", Miscellaneous::setfpscap},
+
+	{nullptr, nullptr},
+};
+
+static const luaL_Reg FileSystemFunctions[] = {
+	{"writefile", CravexEnv::env::test::Filesystem::writefile},
+	{"isfolder", CravexEnv::env::test::Filesystem::isfolder},
+	{"readfile", CravexEnv::env::test::Filesystem::readfile},
+	{"makefolder", CravexEnv::env::test::Filesystem::makefolder},
+	{"appendfile", CravexEnv::env::test::Filesystem::appendfile},
+	{"isfile", CravexEnv::env::test::Filesystem::isfile},
+	{"loadfile", CravexEnv::env::test::Filesystem::loadfile},
+	{"delfile", CravexEnv::env::test::Filesystem::delfile},
+	{"delfolder", CravexEnv::env::test::Filesystem::delfolder},
+	{"getcustomasset", CravexEnv::env::test::Filesystem::getcustomasset},
+	{"listfiles", CravexEnv::env::test::Filesystem::listfiles},
+
+	{nullptr, nullptr},
+};
+
+static const luaL_Reg DebugFunctions[] = {
+	{ "getconstant", Debug::getconstant },
+	{ "getconstants", Debug::getconstants },
+	{ "getinfo", Debug::getinfo },
+	{ "getproto", Debug::getproto },
+	{ "getprotos", Debug::getprotos },
+	{ "getstack", Debug::getstack },
+	{ "getupvalue", Debug::getupvalue },
+	{ "getupvalues", Debug::getupvalues },
+
+	{ nullptr, nullptr },
+};
+
+static const luaL_Reg CacheFunctions[] = {
+	{"invalidate", Cache::invalidate},
+	{"replace", Cache::replace},
+	{"iscached", Cache::iscached},
+
+	{nullptr, nullptr},
+};
+
+static const luaL_Reg ConsoleFunctions[] = {
+	{"rconsolecreate", ConsoleLib::rconsolecreate},
+	{"rconsoleprint", ConsoleLib::rconsoleprint},
+	{"rconsoleclear", ConsoleLib::rconsoleclear},
+	{"rconsoledestroy", ConsoleLib::rconsoledestroy},
+	{"rconsolewarn", ConsoleLib::rconsolewarn},
+	{"rconsoleerr", ConsoleLib::rconsoleerr},
+	{"rconsolehidden", ConsoleLib::rconsolehidden},
+	{"rconsolehide", ConsoleLib::rconsolehide},
+	{"rconsoleshow", ConsoleLib::rconsoleshow},
+	{"rconsoleinput", ConsoleLib::rconsoleinput},
+	{"rconsoleinfo", ConsoleLib::rconsoleinfo},
+	{"rconsoletopmost", ConsoleLib::rconsoletopmost},
+	{"rconsoletoggle", ConsoleLib::rconsoletoggle},
+	{"rconsolesettitle", ConsoleLib::rconsolesettitle},
+
+	{nullptr, nullptr},
+};
+
+static const luaL_Reg CryptFunctions[] = {
+	//{"base64encode", CravexEnv::env::cryptLibrary::base64encode},
+	//{"base64decode", CravexEnv::env::cryptLibrary::base64decode},
+	//{"hash", CravexEnv::env::cryptLibrary::hash},
+	//{"generatekey", CravexEnv::env::cryptLibrary::generatekey},
+	//{"generatebytes", CravexEnv::env::cryptLibrary::generatebytes},
+	//{"encrypt", CravexEnv::env::cryptLibrary::encrypt},
+	//{"decrypt", CravexEnv::env::cryptLibrary::decrypt},
+
+	{nullptr, nullptr},
+};
+
+static const luaL_Reg EnvironmentFunctions[] = {
+	{"cloneref", Cache::cloneref},
+	{"getscriptbytecode", CravexEnv::env::test::getscriptbytecode},
+	{"compareinstances", CravexEnv::env::test::compareinstances},
+
+	{"hookmetamethod", CravexEnv::env::test::hookmetamethod},
+	{"getnamecallmethod", CravexEnv::env::test::getnamecallmethod},
+
+	{"isreadonly", CravexEnv::env::test::isreadonly},
+	{"setreadonly", CravexEnv::env::test::setreadonly},
+
+	{"getinstances", CravexEnv::env::test::getinstances},
+	{"getnilinstances", CravexEnv::env::test::getnilinstances},
+	{"getrunningscripts", CravexEnv::env::test::getrunningscripts},
+
+	{"firetouchinterest", CravexEnv::env::test::firetouchinterest},
+
+	{"getclipboard", CravexEnv::env::test::getclipboard},
+
+	{"checkcaller", CravexEnv::env::test::checkcaller},
+
+	{"setthreadidentity", CravexEnv::env::test::setthreadidentity},
+	{"getthreadidentity", CravexEnv::env::test::getthreadidentity},
+
+	{"setrawmetatable", CravexEnv::env::test::setrawmetatable},
+	{"getrawmetatable", CravexEnv::env::test::getrawmetatable},
+
+	{"getloadedmodules", CravexEnv::env::test::getloadedmodules},
+
+	//{"base64_encode", CryptEnvLib::base64encode},
+	//{"base64_decode", CryptEnvLib::base64decode},
+
+	{nullptr, nullptr},
+};
+
+
+/*
+static const luaL_Reg functions[] = {
+				{"loadstring", load_string},
+				{"identifyexecutor", identify_executor},
+				{"httpget", http::httpget},
+
+				{"getgenv", getgenv},
+				{"gethui", get_hui},
+				{"getrenv", getrenv},
+				{"getgc", getgc},
+				//{"getscripts", get_scripts}, // i will recode this later or whatever since it gets all corescripts by default
+
+				{"checkcaller", checkcaller},
+
+				//{"clonefunction", clonefunction},
+				{"cloneref", cloneref},
+
+				//{"request", request},
+
+				{"getinstances", getinstances},
+				{"getnilinstances", getnilinstances},
+				{"getrunningscripts", getrunningscripts},
+
+				{"firetouchinterest", firetouchinterest},
+				//{"fireclickdetector", fireclickdetector},
+
+				{"compareinstances", compareinstances},
+
+				{"getclipboard", getclipboard},
+				{"setclipboard", setclipboard},
+
+				{"hookmetamethod", hookmetamethod},
+				{"getnamecallmethod", getnamecallmethod},
+
+				{"isreadonly", isreadonly},
+				{"setreadonly", setreadonly},
+
+				{"setrawmetatable", setrawmetatable},
+				{"getrawmetatable", getrawmetatable},
+
+				{"writefile", Filesystem::writefile},
+				{"isfolder", Filesystem::isfolder},
+				{"readfile", Filesystem::readfile},
+				{"makefolder", Filesystem::makefolder},
+				{"appendfile", Filesystem::appendfile},
+				{"isfile", Filesystem::isfile},
+				{"loadfile", Filesystem::loadfile},
+				{"delfile", Filesystem::delfile},
+				{"delfolder", Filesystem::delfolder},
+				{"getcustomasset", Filesystem::getcustomasset},
+				{"listfiles", Filesystem::listfiles},
+				{nullptr, nullptr}
+			};
+*/
+
+
+void environment::initialize(lua_State* L)
+{
+    //register_env_functions(L, CravexEnv::env::test::functions);
+	//register_env_members(L, CravexEnv::env::cache::functions, "cache");
+	//register_env_members(L, CravexEnv::env::Debug::functions, "debug");
+	
+	register_env_functions(L, ScriptsFunctions);
+	register_env_functions(L, MiscellaneousFunctions);
+	register_env_functions(L, FileSystemFunctions);
+	register_env_functions(L, EnvironmentFunctions);
+	register_env_functions(L, ConsoleFunctions);
+
+	register_env_table(L, DebugFunctions, "debug");
+	register_env_table(L, CacheFunctions, "cache");
+	register_env_table(L, CryptFunctions, "crypt");
+
+	CravexEnv::name_call::initialize(L);
+
+    lua_newtable(L);
+    lua_setglobal(L, "_G");
+
+    lua_newtable(L);
+    lua_setglobal(L, "shared");
+
+	lua_setglobal(L, "__hiddeninterface");
+}
