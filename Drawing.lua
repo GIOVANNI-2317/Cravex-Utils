@@ -1,4 +1,4 @@
-        local coreGui = game:GetService("CoreGui")
+local coreGui = game:GetService("CoreGui")
 
 local camera = workspace.CurrentCamera
 local drawingUI = Instance.new("ScreenGui")
@@ -971,5 +971,24 @@ end
 getgenv().cleardrawcache = function()
 	for _, drawing in drawingUI:GetDescendants() do
 		drawing:Remove()
+	end
+end)";
+
+std::string cachePart = R"(
+local cache = {}
+getgenv().getsenv = function(scr)
+    
+    if cache[scr] then
+        return cache[scr]
+    end
+
+	for i, v in getreg() do
+		if type(v) == "thread" then
+			local tenv = gettenv(v);
+			if tenv.script == scr then
+				cache[scr] = tenv
+				return tenv;
+			end
+		end
 	end
 end
