@@ -73,11 +73,11 @@ task.defer(function()
 	fullText = fullText.."\n⛔ " .. fails .. " tests failed"
 	fullText = fullText.."\n⚠️ " .. undefined .. " globals are missing aliases"
 	wait(1)
-	if isfile("UNC Results.lua") then
-		delfile("UNC Results.lua")
-		writefile("UNC Results.lua", fullText)
+	if isfile("UNC Results.crvx") then
+		delfile("UNC Results.crvx")
+		writefile("UNC Results.crvx", fullText)
 	else
-		writefile("UNC Results.lua", fullText)
+		writefile("UNC Results.crvx", fullText)
 	end
 end)
 
